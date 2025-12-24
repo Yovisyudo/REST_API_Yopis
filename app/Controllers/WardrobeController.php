@@ -150,19 +150,27 @@ class WardrobeController extends ResourceController
     }
 
     // 5. DELETE (Hapus Baju)
-    public function delete($id = null)
-    {
-        $model = new WardrobeModel();
-        $userId = $this->getUserId();
+   public function delete($id = null)
+{
+    $model = new WardrobeModel();
+    $userId = $this->getUserId();
 
-        // Cek kepemilikan sebelum hapus
-        $exist = $model->where('user_id', $userId)->find($id);
-        
-        if ($exist) {
-            $model->delete($id);
-            return $this->respondDeleted(['id' => $id, 'message' => 'Item berhasil dihapus']);
-        } else {
-            return $this->failNotFound('Item tidak ditemukan atau bukan milik Anda.');
-        }
+    if (!$userId) return $this->failUnauthorized('Akses ditolak.');
+
+    // Cari berdasarkan item_id DAN user_id untuk keamanan
+    $item = $model->where([
+        'item_id' => $id, 
+        'user_id' => $userId
+    ])->first();
+    
+    if ($item) {
+        $model->delete($id);
+        return $this->respondDeleted([
+            'status' => 200,
+            'message' => 'Item berhasil dihapus'
+        ]);
+    } else {
+        return $this->failNotFound('Item tidak ditemukan atau bukan milik Anda.');
     }
+}
 }
