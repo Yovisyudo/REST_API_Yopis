@@ -3,74 +3,42 @@
 namespace App\Controllers;
 
 use App\Models\EventModel;
-use App\Models\UserModel; // <--- Jangan lupa load ini
+use App\Models\UserModel;
 use App\Libraries\WeatherAPI;
 use CodeIgniter\RESTful\ResourceController;
 
 class EventController extends ResourceController
 {
     protected $modelName = 'App\Models\EventModel';
-    protected $format = 'json';
+    protected $format    = 'json';
 
     // =========================================================================
-    // 1. HELPER: PENERJEMAH (Firebase UID String -> User ID Database Angka)
+    // 1. HELPER: AMBIL USER ID (Sudah diproses oleh AuthFilter)
     // =========================================================================
-// HELPER HYBRID: Bisa terima user Manual & Firebase
     private function getInternalUserId()
     {
-        // 1. CEK: Apakah dia login Manual? (Dapat ID Angka langsung)
-        if (isset($_SERVER['MANUAL_USER_ID'])) {
-            return $_SERVER['MANUAL_USER_ID']; 
-            // Langsung return karena token manual biasanya sudah menyimpan ID asli (angka)
+        // AuthFilter sudah menaruh data user di $this->request->user
+        if (isset($this->request->user)) {
+            // Langsung ambil user_id (angka/INT)
+            return $this->request->user->user_id; 
         }
-
-        // 2. CEK: Apakah dia login Firebase? (Dapat String UID)
-        $firebaseUid = $_SERVER['FIREBASE_UID'] ?? null;
-        
-        if ($firebaseUid) {
-            // Lakukan logika terjemahan yang tadi (Cek DB / Auto Register)
-            $userModel = new UserModel();
-            $existingUser = $userModel->where('firebase_uid', $firebaseUid)->first();
-
-            if ($existingUser) {
-                return $existingUser['user_id'];
-            } 
-            
-            // Auto Register Logic
-            try {
-                $newId = $userModel->insert([
-                    'firebase_uid'     => $firebaseUid,
-                    'name'             => 'User Google Baru', 
-                    'email'            => 'google_' . uniqid() . '@temp.com',
-                    'password'         => password_hash('GOOGLE_PASS', PASSWORD_BCRYPT),
-                    'style_preference' => 'casual'
-                ]);
-                return $newId;
-            } catch (\Exception $e) {
-                return null;
-            }
-        }
-
-        // 3. Gak ada dua-duanya
         return null;
     }
+
     // =========================================================================
     // 2. CREATE (Tambah Event)
     // =========================================================================
     public function create()
     {
-        // PANGGIL HELPER BARU
         $internalUserId = $this->getInternalUserId();
 
-        // Cek jika gagal dapat ID
         if (!$internalUserId) {
             return $this->failUnauthorized('Gagal mengidentifikasi User. Silakan login ulang.');
         }
 
-        // Validasi Input
         $rules = [
-            'name' => 'required',
-            'date' => 'required|valid_date',
+            'name'     => 'required',
+            'date'     => 'required|valid_date',
             'location' => 'required'
         ];
 
@@ -78,35 +46,31 @@ class EventController extends ResourceController
             return $this->fail($this->validator->getErrors());
         }
 
-        // Ambil Inputan
-        $location = $this->request->getVar('location');
+        $location  = $this->request->getVar('location');
         $dateEvent = $this->request->getVar('date');
 
-        // --- FETCH WEATHER ---
+        // Panggil WeatherAPI
         $weatherAPI = new WeatherAPI();
-        $weather = $weatherAPI->getWeather($location, $dateEvent);
+        $weather    = $weatherAPI->getWeather($location, $dateEvent);
 
-        // Susun Data
         $data = [
-            'user_id' => $internalUserId, // <--- SEKARANG INI ADALAH ANGKA (INT)
-            'name' => $this->request->getVar('name'),
-            'description' => $this->request->getVar('description'),
-            'date' => $dateEvent,
-            'location' => $location,
-            'weather_temp' => $weather['temp'] ?? null,
+            'user_id'           => $internalUserId, // Hasil dari AuthFilter
+            'name'              => $this->request->getVar('name'),
+            'description'       => $this->request->getVar('description'),
+            'date'              => $dateEvent,
+            'location'          => $location,
+            'weather_temp'      => $weather['temp'] ?? null,
             'weather_condition' => $weather['condition'] ?? null
         ];
 
-        // Simpan ke Database
+        // Simpan ke tabel 'events'
         $eventId = $this->model->insert($data);
 
         if ($eventId) {
             return $this->respondCreated([
-                'success' => true,
-                'event_id' => $eventId,
-                'message' => 'Event berhasil dibuat',
-                'weather_info' => $weather ? "Prediksi: {$weather['condition']} ({$weather['temp']}°C)" : "Cuaca n/a",
-                'data' => $data
+                'success'  => true,
+                'message'  => 'Event berhasil dibuat',
+                'data'     => $data
             ]);
         }
 
@@ -114,18 +78,16 @@ class EventController extends ResourceController
     }
 
     // =========================================================================
-    // 3. GET ALL (List Event User)
+    // 3. INDEX (Daftar Event)
     // =========================================================================
     public function index()
     {
-        // PANGGIL HELPER BARU
         $internalUserId = $this->getInternalUserId();
 
         if (!$internalUserId) {
             return $this->failUnauthorized('User ID tidak terbaca');
         }
 
-        // Query menggunakan ID ANGKA
         $events = $this->model
             ->where('user_id', $internalUserId)
             ->orderBy('date', 'ASC')
@@ -133,7 +95,41 @@ class EventController extends ResourceController
 
         return $this->respond([
             'success' => true,
-            'events' => $events
+            'events'  => $events // Key ini harus sama dengan di EventRemoteDataSource
         ]);
+    }
+
+    // =========================================================================
+    // 4. DELETE (Hapus Event)
+    // =========================================================================
+    public function delete($id = null)
+    {
+        $internalUserId = $this->getInternalUserId();
+
+        if (!$internalUserId) {
+            return $this->failUnauthorized('Silakan login ulang.');
+        }
+
+        // Cari event di database
+        $event = $this->model->find($id);
+
+        if (!$event) {
+            return $this->failNotFound('Event tidak ditemukan');
+        }
+
+        // KEAMANAN: Pastikan user_id di tabel (misal ID: 3) 
+        // sama dengan user yang login (misal ID: 7)
+        if ($event['user_id'] != $internalUserId) {
+            return $this->failForbidden('Anda tidak diizinkan menghapus event ini.');
+        }
+
+        if ($this->model->delete($id)) {
+            return $this->respondDeleted([
+                'success' => true,
+                'message' => 'Event berhasil dihapus'
+            ]);
+        }
+
+        return $this->fail('Gagal menghapus data dari database');
     }
 }
